@@ -21,8 +21,9 @@ local openidc = require("resty.openidc")
 local random  = require("resty.random")
 local string  = string
 local ngx     = ngx
-local ipairs = ipairs
-local concat = table.concat
+local ipairs  = ipairs
+local type    = type
+local concat  = table.concat
 
 local ngx_encode_base64 = ngx.encode_base64
 
@@ -72,6 +73,15 @@ local schema = {
                     description = "the key used for the encrypt and HMAC calculation",
                     minLength = 16,
                 },
+                cookie = {
+                    type = "object",
+                    properties = {
+                        lifetime = {
+                            type = "integer",
+                            description = "it holds the cookie lifetime in seconds in the future",
+                        }
+                    }
+                }
             },
             required = {"secret"},
             additionalProperties = false,
@@ -79,6 +89,32 @@ local schema = {
         realm = {
             type = "string",
             default = "apisix",
+        },
+        claim_validator = {
+            type = "object",
+            properties = {
+                audience = {
+                    type = "object",
+                    description = "audience claim value to validate",
+                    properties = {
+                        claim = {
+                            type = "string",
+                            description = "custom claim name",
+                            default = "aud",
+                        },
+                        required = {
+                            type = "boolean",
+                            description = "audience claim is required",
+                            default = false,
+                        },
+                        match_with_client_id = {
+                            type = "boolean",
+                            description = "audience must euqal to or includes client_id",
+                            default = false,
+                        }
+                    },
+                },
+            },
         },
         logout_path = {
             type = "string",
@@ -103,7 +139,7 @@ local schema = {
         public_key = {type = "string"},
         token_signing_alg_values_expected = {type = "string"},
         use_pkce = {
-            description = "when set to true the PKEC(Proof Key for Code Exchange) will be used.",
+            description = "when set to true the PKCE(Proof Key for Code Exchange) will be used.",
             type = "boolean",
             default = false
         },
@@ -251,6 +287,15 @@ local schema = {
             description = "Name of the expiry claim that controls the cached access token TTL.",
             type = "string"
         },
+        introspection_addon_headers = {
+            description = "Extra http headers in introspection",
+            type = "array",
+            minItems = 1,
+            items = {
+                type = "string",
+                pattern = "^[^:]+$"
+            }
+        },
         required_scopes = {
             description = "List of scopes that are required to be granted to the access token",
             type = "array",
@@ -259,7 +304,7 @@ local schema = {
             }
         }
     },
-    encrypt_fields = {"client_secret"},
+    encrypt_fields = {"client_secret", "client_rsa_private_key"},
     required = {"client_id", "client_secret", "discovery"}
 }
 
@@ -286,6 +331,11 @@ function _M.check_schema(conf)
             secret = ngx_encode_base64(random.bytes(32, true) or random.bytes(32))
         }
     end
+
+    local check = {"discovery", "introspection_endpoint", "redirect_uri",
+                    "post_logout_redirect_uri", "proxy_opts.http_proxy", "proxy_opts.https_proxy"}
+    core.utils.check_https(check, conf, plugin_name)
+    core.utils.check_tls_bool({"ssl_verify"}, conf, plugin_name)
 
     local ok, err = core.schema.check(schema, conf)
     if not ok then
@@ -377,7 +427,23 @@ local function introspect(ctx, conf)
     else
         -- Validate token against introspection endpoint.
         -- TODO: Same as above for public key validation.
+        if conf.introspection_addon_headers then
+            -- http_request_decorator option provided by lua-resty-openidc
+            conf.http_request_decorator = function(req)
+                local h = req.headers or {}
+                for _, name in ipairs(conf.introspection_addon_headers) do
+                    local value = core.request.header(ctx, name)
+                    if value then
+                        h[name] = value
+                    end
+                end
+                req.headers = h
+                return req
+            end
+        end
+
         local res, err = openidc.introspect(conf)
+        conf.http_request_decorator = nil
 
         if err then
             ngx.header["WWW-Authenticate"] = 'Bearer realm="' .. conf.realm ..
@@ -481,7 +547,7 @@ function _M.rewrite(plugin_conf, ctx)
 
     local response, err, session, _
 
-    if conf.bearer_only or conf.introspection_endpoint or conf.public_key then
+    if conf.bearer_only or conf.introspection_endpoint or conf.public_key or conf.use_jwks then
         -- An introspection endpoint or a public key has been configured. Try to
         -- validate the access token from the request, if it is present in a
         -- request header. Otherwise, return a nil response. See below for
@@ -508,6 +574,40 @@ function _M.rewrite(plugin_conf, ctx)
                     return 403, core.json.encode(error_response)
                 end
             end
+
+            -- jwt audience claim validator
+            local audience_claim = core.table.try_read_attr(conf, "claim_validator",
+                                                             "audience", "claim") or "aud"
+            local audience_value = response[audience_claim]
+            if core.table.try_read_attr(conf, "claim_validator", "audience", "required")
+                and not audience_value then
+                core.log.error("OIDC introspection failed: required audience (",
+                                audience_claim, ") not present")
+                local error_response = { error = "required audience claim not present" }
+                return 403, core.json.encode(error_response)
+            end
+            if core.table.try_read_attr(conf, "claim_validator", "audience", "match_with_client_id")
+                and audience_value ~= nil then
+                local error_response = { error = "mismatched audience" }
+                local matched = false
+                if type(audience_value) == "table" then
+                    for _, v in ipairs(audience_value) do
+                        if conf.client_id == v then
+                            matched = true
+                        end
+                    end
+                    if not matched then
+                        core.log.error("OIDC introspection failed: ",
+                                        "audience list does not contain the client id")
+                        return 403, core.json.encode(error_response)
+                    end
+                elseif conf.client_id ~= audience_value then
+                    core.log.error("OIDC introspection failed: ",
+                                    "audience does not match the client id")
+                    return 403, core.json.encode(error_response)
+                end
+            end
+
             -- Add configured access token header, maybe.
             add_access_token_header(ctx, conf, access_token)
 
@@ -537,6 +637,9 @@ function _M.rewrite(plugin_conf, ctx)
         response, err, _, session  = openidc.authenticate(conf, nil, unauth_action, conf.session)
 
         if err then
+            if session then
+                session:close()
+            end
             if err == "unauthorized request" then
                 if conf.unauth_action == "pass" then
                     return nil
@@ -573,6 +676,9 @@ function _M.rewrite(plugin_conf, ctx)
                 core.request.set_header(ctx, "X-Refresh-Token", session.data.refresh_token)
             end
         end
+    end
+    if session then
+        session:close()
     end
 end
 
